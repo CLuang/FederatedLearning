@@ -75,6 +75,19 @@ impl Client {
         Ok((stream, listener))
     }
 
+    fn get(&self, model_name: &str) -> Option<(Vec<f32>, Vec<f32>, String)> {
+        if let Some((model, _, status)) = &self.model {
+            if model_name != "mnist" {
+                return None;
+            }
+            let weights_data = model.weight().ok()?.to_vec2::<f32>().ok()?.into_iter().flatten().collect::<Vec<f32>>();
+            let bias_data = model.bias().ok()?.to_vec1::<f32>().ok()?;
+            Some((weights_data, bias_data, status.clone()))
+        } else {
+            None
+        }
+    }
+
     async fn train(&mut self, model_name: &str, epochs: usize) -> CandleResult<()> {
         if let Some((model, varmap, status)) = &mut self.model {
             if *status != "initialized" && *status != "ready" {
@@ -120,25 +133,15 @@ impl Client {
         Ok(())
     }
 
-    fn get(&self, model_name: &str) -> Option<(Vec<f32>, Vec<f32>, String)> {
-        if let Some((model, _, status)) = &self.model {
-            if model_name != "mnist" {
-                return None;
-            }
-            let weights_data = model.weight().ok()?.to_vec2::<f32>().ok()?.into_iter().flatten().collect::<Vec<f32>>();
-            let bias_data = model.bias().ok()?.to_vec1::<f32>().ok()?;
-            Some((weights_data, bias_data, status.clone()))
-        } else {
-            None
-        }
-    }
-
     fn test(&self, model_name: &str) -> CandleResult<f32> {
         if let Some((model, _, _)) = &self.model {
             if model_name != "mnist" {
-                return Err(candle_core::Error::Msg("Model not found".into()));
+                return Err(candle_core::Error::Msg(format!(
+                    "Model '{}' not found, only 'mnist' is supported",
+                    model_name
+                )));
             }
-            let dev = Device::Cpu;
+            let dev = model.weight()?.device().clone();
             let test_images = self.dataset.test_images.to_device(&dev)?;
             let test_labels = self.dataset.test_labels.to_dtype(DType::U32)?.to_device(&dev)?;
             let logits = Module::forward(model, &test_images)?;
@@ -148,7 +151,8 @@ impl Client {
                 .to_dtype(DType::F32)?
                 .sum_all()?
                 .to_scalar::<f32>()?;
-            let accuracy = sum_ok / test_labels.dims1()? as f32;
+            let n_samples = test_labels.dims1()?;
+            let accuracy = sum_ok / n_samples as f32;
             Ok(accuracy)
         } else {
             Err(candle_core::Error::Msg("No model available".into()))
