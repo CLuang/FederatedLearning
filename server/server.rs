@@ -1,3 +1,8 @@
+// Description: A simple federated learning server that manages clients and aggregates model updates.
+// This server is designed to work with a linear model for the MNIST dataset.
+// It handles client registration, model initialization, and training rounds.
+// It also provides a command-line interface for server commands and client interactions.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -39,6 +44,12 @@ impl Server {
         self.ready_clients.insert(client_ip, false);
     }
 
+    fn remove_client(&mut self, client_ip: &str) {
+        println!("Removing client {} from tracking", client_ip);
+        self.clients.remove(client_ip);
+        self.ready_clients.remove(client_ip);
+    }
+
     fn mark_ready(&mut self, client_ip: &str) {
         if let Some(ready) = self.ready_clients.get_mut(client_ip) {
             *ready = true;
@@ -46,11 +57,6 @@ impl Server {
         }
     }
 
-    fn remove_client(&mut self, client_ip: &str) {
-        println!("Removing client {} from tracking", client_ip);
-        self.clients.remove(client_ip);
-        self.ready_clients.remove(client_ip);
-    }
 
     fn init(&mut self) -> CandleResult<()> {
         let varmap = VarMap::new();
@@ -68,16 +74,38 @@ impl Server {
         self.model.as_ref()
     }
 
-    async fn aggregate_updates(&mut self, updates: Vec<(Vec<f32>, Vec<f32>)>) -> CandleResult<()> {
+    fn aggregate_updates(&mut self, updates: Vec<(Vec<f32>, Vec<f32>)>) -> CandleResult<()> {
+        // Check if there are any updates to process
+        if updates.is_empty() {
+            return Err(candle_core::Error::Msg("No updates to aggregate".to_string()));
+        }
+    
+        // Get model components with proper error handling
         let (model, varmap, status) = self.model.as_mut().ok_or_else(|| {
             candle_core::Error::Msg("Model not initialized".to_string())
         })?;
-
+    
+        // Initialize accumulators with correct sizes
         let mut weights_sum: Vec<f32> = vec![0.0; 10 * 784];
         let mut bias_sum: Vec<f32> = vec![0.0; 10];
         let num_clients = updates.len() as f32;
-
+    
+        // Aggregate updates with shape validation
         for (weights_data, bias_data) in &updates {
+            if weights_data.len() != 10 * 784 {
+                return Err(candle_core::Error::Msg(format!(
+                    "Expected weights length {}, got {}",
+                    10 * 784,
+                    weights_data.len()
+                )));
+            }
+            if bias_data.len() != 10 {
+                return Err(candle_core::Error::Msg(format!(
+                    "Expected bias length 10, got {}",
+                    bias_data.len()
+                )));
+            }
+            
             for (i, &w) in weights_data.iter().enumerate() {
                 weights_sum[i] += w;
             }
@@ -85,24 +113,56 @@ impl Server {
                 bias_sum[i] += b;
             }
         }
-
+    
+        // Compute averages
         let weights_avg: Vec<f32> = weights_sum.into_iter().map(|w| w / num_clients).collect();
         let bias_avg: Vec<f32> = bias_sum.into_iter().map(|b| b / num_clients).collect();
-
+    
+        // Create tensors from averages
         let weights_tensor = Tensor::from_vec(weights_avg, &[10, 784], &Device::Cpu)?;
         let bias_tensor = Tensor::from_vec(bias_avg, &[10], &Device::Cpu)?;
-
-        let mut data = varmap.data().lock().unwrap();
-        data.get_mut("linear.weight")
-            .expect("linear.weight missing")
-            .set(&weights_tensor)?;
-        data.get_mut("linear.bias")
-            .expect("linear.bias missing")
-            .set(&bias_tensor)?;
-
+    
+        // Update variable map with proper error handling
+        let mut data = varmap.data().lock().map_err(|e| {
+            candle_core::Error::Msg(format!("Failed to lock varmap: {}", e))
+        })?;
+    
+        let weight_var = data.get_mut("linear.weight").ok_or_else(|| {
+            candle_core::Error::Msg("linear.weight missing from varmap".to_string())
+        })?;
+        weight_var.set(&weights_tensor)?;
+    
+        let bias_var = data.get_mut("linear.bias").ok_or_else(|| {
+            candle_core::Error::Msg("linear.bias missing from varmap".to_string())
+        })?;
+        bias_var.set(&bias_tensor)?;
+    
+        // Update status and log
         *status = "ready".to_string();
         println!("Global model {} updated with {} client updates", MODEL_NAME, updates.len());
+    
         Ok(())
+    }
+
+    fn test(&self) -> CandleResult<f32> {
+        let (model, _, _) = self.model.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg("Model not initialized please initialize".to_string())
+        })?;
+        let test_dataset = self.test_dataset.as_ref().ok_or_else(|| {
+            candle_core::Error::Msg("Testing dataset not loaded".to_string())
+        })?;
+        let dev = &Device::Cpu;
+        let test_images = test_dataset.test_images.to_device(dev)?;
+        let test_labels = test_dataset.test_labels.to_dtype(DType::U32)?.to_device(dev)?;
+        let logits = model.forward(&test_images)?;
+        let sum_ok = logits
+            .argmax(D::Minus1)?
+            .eq(&test_labels)?
+            .to_dtype(DType::F32)?
+            .sum_all()?
+            .to_scalar::<f32>()?;
+        let accuracy = sum_ok / test_labels.dims1()? as f32;
+        Ok(accuracy)
     }
 
     async fn train(&self, clients_to_use: usize, rounds: usize, epochs: usize, server: Arc<Mutex<Self>>) -> Result<()> {
@@ -152,7 +212,7 @@ impl Server {
                         model.bias()?.to_vec1::<f32>()?
                     )
                 } else {
-                    return Err(anyhow::anyhow!("Model not initialized"));
+                    return Err(anyhow::anyhow!("Model not initialized please initialize"));
                 }
             };
             let weights = bincode::serialize(&weights_data)?;
@@ -193,7 +253,7 @@ impl Server {
                                 }
                             }
                         }
-                        Err(e) => eprintln!("Failed to connect to {}: {}", client_ip, e),
+                        Err(e) => eprintln!("Failed to connect {}: {}", client_ip, e),
                     }
                     Ok::<(), anyhow::Error>(())
                 });
@@ -212,7 +272,7 @@ impl Server {
 
             if !updates.is_empty() {
                 let mut server_guard = server.lock().await;
-                server_guard.aggregate_updates(updates).await?;
+                server_guard.aggregate_updates(updates)?;
                 println!("Completed training round {}", round);
             } else {
                 println!("No updates received in round {}", round);
@@ -236,35 +296,15 @@ impl Server {
         Ok(())
     }
 
-    fn test(&self) -> CandleResult<f32> {
-        let (model, _, _) = self.model.as_ref().ok_or_else(|| {
-            candle_core::Error::Msg("Model not initialized".to_string())
-        })?;
-        let test_dataset = self.test_dataset.as_ref().ok_or_else(|| {
-            candle_core::Error::Msg("Test dataset not loaded".to_string())
-        })?;
-        let dev = &Device::Cpu;
-        let test_images = test_dataset.test_images.to_device(dev)?;
-        let test_labels = test_dataset.test_labels.to_dtype(DType::U32)?.to_device(dev)?;
-        let logits = model.forward(&test_images)?;
-        let sum_ok = logits
-            .argmax(D::Minus1)?
-            .eq(&test_labels)?
-            .to_dtype(DType::F32)?
-            .sum_all()?
-            .to_scalar::<f32>()?;
-        let accuracy = sum_ok / test_labels.dims1()? as f32;
-        Ok(accuracy)
-    }
 
     async fn handle_client(stream: TcpStream, server: Arc<Mutex<Server>>) -> Result<()> {
         let mut buffer = [0; 65536];
         let peer_addr = stream.peer_addr()?.to_string();
-        println!("Handling client connection from {}", peer_addr);
+        println!("Taking Client connection from {}", peer_addr);
         let mut client_listening_addr: Option<String> = None;
-
+    
         let mut stream = stream;
-
+    
         loop {
             match stream.read(&mut buffer).await {
                 Ok(0) => {
@@ -278,24 +318,25 @@ impl Server {
                 Ok(n) => {
                     let message = String::from_utf8_lossy(&buffer[..n]).to_string();
                     let parts: Vec<&str> = message.split('|').collect();
-
+    
                     let mut server_guard = server.lock().await;
                     match parts[0] {
                         "REGISTER" if parts.len() == 2 => {
                             let client_ip = parts[1].to_string();
                             server_guard.register(client_ip.clone());
-                            client_listening_addr = Some(client_ip.clone());
-                            stream.write_all(b"Registered successfully").await?;
-                            stream.flush().await?;
+                            client_listening_addr = Some(client_ip);
+                            if stream.write_all(b"Registered successfully").await.is_ok() {
+                                let _ = stream.flush().await;
+                            }
                         }
                         "READY" => {
                             if let Some(ref client_ip) = client_listening_addr {
                                 server_guard.mark_ready(client_ip);
-                                stream.write_all(b"Waiting for training round").await?;
-                                stream.flush().await?;
-                            } else {
-                                stream.write_all(b"Error: Client not registered").await?;
-                                stream.flush().await?;
+                                if stream.write_all(b"Waiting for training round").await.is_ok() {
+                                    let _ = stream.flush().await;
+                                }
+                            } else if stream.write_all(b"Error: Client not registered").await.is_ok() {
+                                let _ = stream.flush().await;
                             }
                         }
                         "GET" => {
@@ -310,27 +351,32 @@ impl Server {
                                     base64::engine::general_purpose::STANDARD.encode(&bias),
                                     status
                                 );
-                                stream.write_all(response.as_bytes()).await?;
-                            } else {
-                                stream.write_all(b"Model not found").await?;
+                                if stream.write_all(response.as_bytes()).await.is_ok() {
+                                    let _ = stream.flush().await;
+                                }
+                            } else if stream.write_all(b"Model not found").await.is_ok() {
+                                let _ = stream.flush().await;
                             }
-                            stream.flush().await?;
                         }
                         "TEST" => {
                             match server_guard.test() {
                                 Ok(accuracy) => {
                                     let response = format!("ACCURACY|{}", accuracy);
-                                    stream.write_all(response.as_bytes()).await?;
+                                    if stream.write_all(response.as_bytes()).await.is_ok() {
+                                        let _ = stream.flush().await;
+                                    }
                                 }
                                 Err(e) => {
-                                    stream.write_all(format!("Error: {}", e).as_bytes()).await?;
+                                    if stream.write_all(format!("Error: {}", e).as_bytes()).await.is_ok() {
+                                        let _ = stream.flush().await;
+                                    }
                                 }
                             }
-                            stream.flush().await?;
                         }
                         _ => {
-                            stream.write_all(b"Invalid command").await?;
-                            stream.flush().await?;
+                            if stream.write_all(b"Invalid command").await.is_ok() {
+                                let _ = stream.flush().await;
+                            }
                         }
                     }
                     drop(server_guard);
@@ -344,20 +390,6 @@ impl Server {
                     break;
                 }
             }
-        }
-        Ok(())
-    }
-
-    fn handle_get_command(&self) -> Result<()> {
-        if let Some((model, _, status)) = self.get_model() {
-            let weights_data = model.weight()?.to_vec2::<f32>()?.into_iter().flatten().collect::<Vec<f32>>();
-            let bias_data = model.bias()?.to_vec1::<f32>()?;
-            println!("Model: {}", MODEL_NAME);
-            println!("Weights: {:?}", weights_data);
-            println!("Bias: {:?}", bias_data);
-            println!("Status: {}", status);
-        } else {
-            println!("Model '{}' not found", MODEL_NAME);
         }
         Ok(())
     }
@@ -454,6 +486,21 @@ impl Server {
         }
         Ok(())
     }
+
+    fn handle_get_command(&self) -> Result<()> {
+        if let Some((model, _, status)) = self.get_model() {
+            let weights_data = model.weight()?.to_vec2::<f32>()?.into_iter().flatten().collect::<Vec<f32>>();
+            let bias_data = model.bias()?.to_vec1::<f32>()?;
+            println!("Model: {}", MODEL_NAME);
+            println!("Weights: {:?}", weights_data);
+            println!("Bias: {:?}", bias_data);
+            println!("Status: {}", status);
+        } else {
+            println!("Model '{}' not found", MODEL_NAME);
+        }
+        Ok(())
+    }
+    
 }
 
 #[tokio::main]

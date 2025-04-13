@@ -1,3 +1,7 @@
+// Client code for a federated learning setup using Candle and Tokio
+// This code implements a client that connects to a server, trains a model on a subset of the MNIST dataset,
+// and communicates with the server to send and receive model updates.
+
 use candle_core::{DType, Result as CandleResult, Tensor, D, Module, Device};
 use candle_nn::{loss, ops, Optimizer, VarBuilder, VarMap, SGD};
 use candle_datasets::vision::Dataset;
